@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# User-specific application state
+config.json
+
+# User-provided engines and opening books
+engines/*.exe
+books/*.bin
+
