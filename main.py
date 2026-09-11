@@ -1,5 +1,6 @@
 """OTBMaster3D: desktop chess with clocks, engines, and OpenGL rendering."""
 
+import colorsys
 import json
 import math
 import random
@@ -10,7 +11,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import chess
 import chess.engine
@@ -18,6 +19,7 @@ import chess.polyglot
 import glfw
 from OpenGL.GL import *
 from OpenGL.GLU import *
+from PIL import Image, ImageOps, ImageTk
 
 try:
     import winsound
@@ -36,11 +38,13 @@ BOARD_Y = 0.0
 DEFAULT_LIGHT = (0.77, 0.68, 0.53)
 DEFAULT_DARK = (0.31, 0.20, 0.12)
 DEFAULT_FRAME = (0.22, 0.11, 0.05)
+DEFAULT_BACKGROUND = (0.055, 0.055, 0.065)
 WHITE_PIECE = (0.88, 0.82, 0.68)
 BLACK_PIECE = (0.16, 0.14, 0.12)
 SELECT = (0.25, 0.63, 0.92)
 LEGAL = (0.24, 0.78, 0.38)
 COORD = (0.88, 0.84, 0.72)
+TURN_INDICATOR = (1.00, 0.42, 0.08)
 
 PROFILES = {
     chess.PAWN: [
@@ -261,7 +265,11 @@ def default_config():
         "light_square": list(DEFAULT_LIGHT),
         "dark_square": list(DEFAULT_DARK),
         "frame_color": list(DEFAULT_FRAME),
+        "background_color": list(DEFAULT_BACKGROUND),
+        "background_image": "",
         "show_coordinates": True,
+        "show_move_indicator": True,
+        "sound_enabled": True,
         "time_control": "Bullet 1+0",
         "engine_side": "None",
         "engine_path": "",
@@ -428,6 +436,19 @@ def draw_box(cx, cy, cz, sx, sy, sz, color):
         for v in vs:
             glVertex3f(*v)
     glEnd()
+
+
+def draw_disc(x, y, z, radius, color, segments=32):
+    """Draw a small upward-facing disc on the board plane."""
+    glDisable(GL_LIGHTING)
+    glColor3f(*color)
+    glBegin(GL_TRIANGLE_FAN)
+    glVertex3f(x, y, z)
+    for step in range(segments + 1):
+        angle = 2 * math.pi * step / segments
+        glVertex3f(x + radius * math.cos(angle), y, z - radius * math.sin(angle))
+    glEnd()
+    glEnable(GL_LIGHTING)
 
 
 def lathe(profile, color, segments=30):
@@ -599,7 +620,15 @@ class Chess3D:
         self.light_square = tuple(self.cfg["light_square"])
         self.dark_square = tuple(self.cfg["dark_square"])
         self.frame_color = tuple(self.cfg["frame_color"])
+        self.background_color = tuple(
+            self.cfg.get("background_color", DEFAULT_BACKGROUND)
+        )
+        self.background_image_path = self.cfg.get("background_image", "")
+        self.background_texture = None
+        self.background_texture_size = None
         self.show_coordinates = bool(self.cfg["show_coordinates"])
+        self.show_move_indicator = bool(self.cfg.get("show_move_indicator", True))
+        self.sound_enabled = bool(self.cfg.get("sound_enabled", True))
         self.yaw = float(self.cfg.get("camera_yaw", 0.0))
         self.pitch = float(self.cfg.get("camera_pitch", math.radians(34)))
         self.distance = float(self.cfg.get("camera_distance", 12.4))
@@ -759,6 +788,59 @@ class Chess3D:
         gluLookAt(*eye, 0, self.target_y, 0, 0, 1, 0)
         glLightfv(GL_LIGHT0, GL_POSITION, (4, 9, -6, 1))
 
+    def draw_background(self):
+        glClearColor(*self.background_color, 1)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        if self.background_texture is None or self.background_texture_size is None:
+            return
+
+        image_width, image_height = self.background_texture_size
+        image_aspect = image_width / image_height
+        viewport_aspect = self.width / max(1, self.height)
+        u0, u1, v0, v1 = 0.0, 1.0, 0.0, 1.0
+        if image_aspect > viewport_aspect:
+            visible_width = viewport_aspect / image_aspect
+            u0 = (1.0 - visible_width) / 2
+            u1 = 1.0 - u0
+        else:
+            visible_height = image_aspect / viewport_aspect
+            v0 = (1.0 - visible_height) / 2
+            v1 = 1.0 - v0
+
+        glDisable(GL_LIGHTING)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glDepthMask(GL_FALSE)
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(-1, 1, -1, 1, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, self.background_texture)
+        glColor3f(1, 1, 1)
+        glBegin(GL_QUADS)
+        glTexCoord2f(u0, v0)
+        glVertex2f(-1, -1)
+        glTexCoord2f(u1, v0)
+        glVertex2f(1, -1)
+        glTexCoord2f(u1, v1)
+        glVertex2f(1, 1)
+        glTexCoord2f(u0, v1)
+        glVertex2f(-1, 1)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glDepthMask(GL_TRUE)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+
     def draw_board(self):
         draw_box(0, -0.14, 0, 8.72, 0.28, 8.72, self.frame_color)
         legal = self.legal_targets()
@@ -771,6 +853,12 @@ class Chess3D:
                 elif sq in legal:
                     col = tuple(0.60 * c + 0.40 * l for c, l in zip(col, LEGAL))
                 draw_box(f - 3.5, 0.005, r - 3.5, 0.995, 0.025, 0.995, col)
+
+        if self.show_move_indicator:
+            indicator_x = 4.17 if math.cos(self.yaw) >= 0 else -4.17
+            indicator_z = -4.17 if self.board.turn == chess.WHITE else 4.17
+            draw_disc(indicator_x, 0.04, indicator_z, 0.055, TURN_INDICATOR)
+
         if self.show_coordinates:
             # Screen-left is +X from White's initial view, so files are stored in
             # reverse world-X order. Keep them on the edge nearest the viewer so
@@ -783,7 +871,7 @@ class Chess3D:
                 draw_glyph(ch, 4.12, 0.035, r - 3.5, self.yaw, 0.18)
 
     def draw(self):
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        self.draw_background()
         self.camera()
         glPushMatrix()
         glTranslatef(self.pan_x, 0, self.pan_z)
@@ -845,10 +933,13 @@ class Chess3D:
         }
 
     def human_can_move(self):
+        engine_has_turn = (
+            self.game_started
+            and self.engine_manager.engine is not None
+            and self.engine_side == self.board.turn
+        )
         return (
-            not self.game_over
-            and not self.awaiting_clock_press
-            and not (self.game_started and self.engine_side == self.board.turn)
+            not self.game_over and not self.awaiting_clock_press and not engine_has_turn
         )
 
     def try_move(self, fr, to, is_engine=False):
@@ -890,9 +981,11 @@ class Chess3D:
                     self.black_time += self.increment
                 self.active_clock_color = self.board.turn
                 self.last_clock_tick = time.perf_counter()
-        play_sound(self.sound_capture if capture else self.sound_move)
+        self.play_game_sound(self.sound_capture if capture else self.sound_move)
         if self.board.is_check():
-            threading.Timer(0.15, lambda: play_sound(self.sound_check)).start()
+            threading.Timer(
+                0.15, lambda: self.play_game_sound(self.sound_check)
+            ).start()
         self.refresh_move_list()
         self.update_game_end()
         if self.game_started and not self.game_over and not self.awaiting_clock_press:
@@ -932,6 +1025,10 @@ class Chess3D:
             self.game_over = True
             self.game_started = False
             self.result_text = "Draw - insufficient material"
+
+    def play_game_sound(self, path):
+        if self.sound_enabled:
+            play_sound(path)
 
     def left_press(self, pos):
         sq = self.square_at_mouse(pos)
@@ -1112,6 +1209,18 @@ class Chess3D:
         if time_control is None:
             return
 
+        requested_engine_side = {
+            "None": None,
+            "White": chess.WHITE,
+            "Black": chess.BLACK,
+        }[self.engine_side_var.get()]
+        engine_unavailable = (
+            requested_engine_side is not None and self.engine_manager.engine is None
+        )
+        if engine_unavailable:
+            requested_engine_side = None
+            self.engine_side_var.set("None")
+
         self.board.reset()
         self.clock_history.clear()
         self.white_time = time_control.initial_seconds
@@ -1124,12 +1233,16 @@ class Chess3D:
         self.awaiting_clock_color = None
         self.game_started = True
         self.game_over = False
-        self.result_text = f"Game started - {time_control.name}"
+        if engine_unavailable:
+            self.result_text = (
+                f"Game started - {time_control.name}; no engine loaded, "
+                "both sides are human"
+            )
+        else:
+            self.result_text = f"Game started - {time_control.name}"
         self.clock_mode = self.clock_mode_var.get()
         self.clock_binding = self.clock_binding_var.get()
-        self.engine_side = {"None": None, "White": chess.WHITE, "Black": chess.BLACK}[
-            self.engine_side_var.get()
-        ]
+        self.engine_side = requested_engine_side
         self.book_path = self.book_var.get()
         self.refresh_move_list()
         self.persist()
@@ -1254,21 +1367,208 @@ class Chess3D:
     def hex(rgb):
         return "#" + "".join(f"{max(0,min(255,round(c*255))):02x}" for c in rgb)
 
-    def choose_color(self, which):
-        current = {
+    def color_value(self, which):
+        return {
             "light": self.light_square,
             "dark": self.dark_square,
             "frame": self.frame_color,
+            "background": self.background_color,
         }[which]
-        c = colorchooser.askcolor(color=self.hex(current))
-        if c and c[0]:
-            val = tuple(v / 255 for v in c[0])
-            if which == "light":
-                self.light_square = val
-            elif which == "dark":
-                self.dark_square = val
-            else:
-                self.frame_color = val
+
+    def set_color_value(self, which, color):
+        if which == "light":
+            self.light_square = color
+        elif which == "dark":
+            self.dark_square = color
+        elif which == "frame":
+            self.frame_color = color
+        else:
+            self.background_color = color
+
+    def choose_color(self, which):
+        original_color = self.color_value(which)
+        original_background_image = self.background_image_path
+        if which == "background":
+            self.delete_background_texture()
+            self.background_image_path = ""
+            self.update_background_label()
+
+        hue, saturation, value = colorsys.rgb_to_hsv(*original_color)
+        picker = tk.Toplevel(self.ui)
+        picker.title(
+            {
+                "light": "Light squares",
+                "dark": "Dark squares",
+                "frame": "Board frame",
+                "background": "Background",
+            }[which]
+        )
+        picker.resizable(False, False)
+        picker.transient(self.ui)
+
+        wheel_size = 180
+        center = wheel_size / 2
+        radius = center - 3
+        wheel_pixels = []
+        for y in range(wheel_size):
+            for x in range(wheel_size):
+                dx = x - center
+                dy = center - y
+                distance = math.hypot(dx, dy)
+                if distance <= radius:
+                    pixel_hue = (math.atan2(dy, dx) / math.tau) % 1.0
+                    pixel_saturation = distance / radius
+                    rgb = colorsys.hsv_to_rgb(pixel_hue, pixel_saturation, 1.0)
+                    wheel_pixels.append(tuple(round(channel * 255) for channel in rgb))
+                else:
+                    wheel_pixels.append((45, 45, 48))
+
+        wheel_source = Image.new("RGB", (wheel_size, wheel_size))
+        wheel_source.putdata(wheel_pixels)
+        wheel_image = ImageTk.PhotoImage(wheel_source)
+        wheel = tk.Canvas(
+            picker,
+            width=wheel_size,
+            height=wheel_size,
+            highlightthickness=0,
+            background="#2d2d30",
+        )
+        wheel.pack(padx=10, pady=(10, 4))
+        wheel.create_image(0, 0, anchor="nw", image=wheel_image)
+        wheel.image = wheel_image
+        marker = wheel.create_oval(0, 0, 0, 0, outline="black", width=2)
+
+        brightness = tk.DoubleVar(value=value)
+        preview = tk.Label(picker, height=2, relief="sunken")
+        preview.pack(fill="x", padx=10, pady=4)
+
+        def update_marker():
+            marker_x = center + math.cos(hue * math.tau) * saturation * radius
+            marker_y = center - math.sin(hue * math.tau) * saturation * radius
+            wheel.coords(marker, marker_x - 5, marker_y - 5, marker_x + 5, marker_y + 5)
+
+        def apply_live_color(*_):
+            color = colorsys.hsv_to_rgb(hue, saturation, brightness.get())
+            self.set_color_value(which, color)
+            preview.config(background=self.hex(color))
+            update_marker()
+
+        def select_from_wheel(event):
+            nonlocal hue, saturation
+            dx = event.x - center
+            dy = center - event.y
+            distance = math.hypot(dx, dy)
+            if distance > radius:
+                return
+            hue = (math.atan2(dy, dx) / math.tau) % 1.0
+            saturation = distance / radius
+            apply_live_color()
+
+        def adjust_brightness(event):
+            step = 0.03 if event.delta > 0 else -0.03
+            brightness.set(max(0.05, min(1.0, brightness.get() + step)))
+            apply_live_color()
+
+        def accept():
+            self.persist()
+            picker.destroy()
+
+        def cancel():
+            self.set_color_value(which, original_color)
+            if which == "background" and original_background_image:
+                self.load_background_image(original_background_image, show_error=False)
+            picker.destroy()
+
+        wheel.bind("<Button-1>", select_from_wheel)
+        wheel.bind("<B1-Motion>", select_from_wheel)
+        wheel.bind("<MouseWheel>", adjust_brightness)
+        ttk.Label(picker, text="Brightness").pack(anchor="w", padx=10)
+        brightness_scale = ttk.Scale(
+            picker,
+            from_=0.05,
+            to=1.0,
+            variable=brightness,
+            command=apply_live_color,
+        )
+        brightness_scale.pack(fill="x", padx=10)
+        brightness_scale.bind("<MouseWheel>", adjust_brightness)
+        actions = ttk.Frame(picker)
+        actions.pack(fill="x", padx=8, pady=10)
+        ttk.Button(actions, text="Cancel", command=cancel).pack(side="right", padx=2)
+        ttk.Button(actions, text="Apply", command=accept).pack(side="right", padx=2)
+        picker.protocol("WM_DELETE_WINDOW", cancel)
+        picker.bind("<Escape>", lambda _event: cancel())
+        apply_live_color()
+        picker.grab_set()
+
+    def delete_background_texture(self):
+        if self.background_texture is not None:
+            glDeleteTextures([self.background_texture])
+        self.background_texture = None
+        self.background_texture_size = None
+
+    def update_background_label(self):
+        if not hasattr(self, "background_var"):
+            return
+        label = (
+            Path(self.background_image_path).name
+            if self.background_image_path
+            else "Solid color"
+        )
+        self.background_var.set(label)
+
+    def load_background_image(self, path, show_error=True):
+        try:
+            with Image.open(path) as source:
+                image = ImageOps.exif_transpose(source).convert("RGB")
+            max_texture_size = int(glGetIntegerv(GL_MAX_TEXTURE_SIZE))
+            if max(image.size) > max_texture_size:
+                image.thumbnail(
+                    (max_texture_size, max_texture_size), Image.Resampling.LANCZOS
+                )
+            image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            width, height = image.size
+            texture = int(glGenTextures(1))
+            glBindTexture(GL_TEXTURE_2D, texture)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGB,
+                width,
+                height,
+                0,
+                GL_RGB,
+                GL_UNSIGNED_BYTE,
+                image.tobytes(),
+            )
+        except Exception as error:
+            if show_error:
+                messagebox.showerror(
+                    "Background image", f"Could not load image:\n{error}"
+                )
+            return False
+
+        self.delete_background_texture()
+        self.background_texture = texture
+        self.background_texture_size = (width, height)
+        self.background_image_path = str(path)
+        self.update_background_label()
+        return True
+
+    def browse_background_image(self):
+        path = filedialog.askopenfilename(
+            title="Choose background image",
+            filetypes=[
+                ("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path and self.load_background_image(path):
             self.persist()
 
     def apply_preset(self, name):
@@ -1291,7 +1591,11 @@ class Chess3D:
                 "light_square": list(self.light_square),
                 "dark_square": list(self.dark_square),
                 "frame_color": list(self.frame_color),
+                "background_color": list(self.background_color),
+                "background_image": self.background_image_path,
                 "show_coordinates": self.show_coordinates,
+                "show_move_indicator": self.show_move_indicator,
+                "sound_enabled": self.sound_enabled,
                 "time_control": (
                     self.time_control_var.get()
                     if hasattr(self, "time_control_var") and self.time_control_var
@@ -1344,6 +1648,14 @@ class Chess3D:
         self.show_coordinates = bool(self.coords_var.get())
         self.persist()
 
+    def toggle_sound(self):
+        self.sound_enabled = bool(self.sound_var.get())
+        self.persist()
+
+    def toggle_move_indicator(self):
+        self.show_move_indicator = bool(self.move_indicator_var.get())
+        self.persist()
+
     def build_ui(self):
         root = tk.Tk()
         self.ui = root
@@ -1357,7 +1669,10 @@ class Chess3D:
         self.engine_side_var = tk.StringVar(value=self.cfg["engine_side"])
         self.engine_var = tk.StringVar(value=self.cfg.get("engine_path", ""))
         self.book_var = tk.StringVar(value=self.cfg.get("book_path", ""))
+        self.background_var = tk.StringVar()
         self.coords_var = tk.BooleanVar(value=self.show_coordinates)
+        self.move_indicator_var = tk.BooleanVar(value=self.show_move_indicator)
+        self.sound_var = tk.BooleanVar(value=self.sound_enabled)
         self.clock_mode_var = tk.StringVar(value=self.cfg.get("clock_mode", "Online"))
         self.clock_binding_var = tk.StringVar(
             value=self.cfg.get("clock_binding", "Spacebar")
@@ -1523,12 +1838,41 @@ class Chess3D:
         ttk.Button(
             cr, text="Board Frame", command=lambda: self.choose_color("frame")
         ).pack(side="left", expand=True, fill="x", padx=1)
+        background_row = ttk.Frame(settings)
+        background_row.pack(fill="x", padx=5, pady=(0, 3))
+        ttk.Button(
+            background_row,
+            text="Background Color",
+            command=lambda: self.choose_color("background"),
+        ).pack(side="left", expand=True, fill="x", padx=1)
+        ttk.Button(
+            background_row,
+            text="Background Image",
+            command=self.browse_background_image,
+        ).pack(side="left", expand=True, fill="x", padx=1)
+        ttk.Label(settings, textvariable=self.background_var).pack(
+            anchor="w", padx=6, pady=(0, 3)
+        )
+        display_options = ttk.Frame(settings)
+        display_options.pack(fill="x", padx=6, pady=(0, 5))
         ttk.Checkbutton(
-            settings,
-            text="Show coordinates",
+            display_options,
+            text="Coordinates",
             variable=self.coords_var,
             command=self.toggle_coords,
-        ).pack(anchor="w", padx=6, pady=(0, 5))
+        ).pack(side="left")
+        ttk.Checkbutton(
+            display_options,
+            text="Sound",
+            variable=self.sound_var,
+            command=self.toggle_sound,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            display_options,
+            text="Move indicator",
+            variable=self.move_indicator_var,
+            command=self.toggle_move_indicator,
+        ).pack(side="left", padx=(12, 0))
 
         ttk.Label(left, textvariable=self.status_var, wraplength=360).pack(
             fill="x", pady=6
@@ -1554,6 +1898,15 @@ class Chess3D:
         if remembered and Path(remembered).exists():
             ok, msg = self.engine_manager.load(remembered)
             self.result_text = msg
+        if self.background_image_path:
+            if not Path(
+                self.background_image_path
+            ).exists() or not self.load_background_image(
+                self.background_image_path, show_error=False
+            ):
+                self.background_image_path = ""
+                self.result_text = "Saved background image was not available"
+        self.update_background_label()
         return root
 
     def ui_tick(self):
@@ -1582,6 +1935,7 @@ class Chess3D:
         finally:
             self.persist()
             self.engine_manager.unload()
+            self.delete_background_texture()
             try:
                 glfw.destroy_window(self.window)
             except Exception:
