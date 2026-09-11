@@ -505,7 +505,8 @@ def draw_piece(piece, x, z, lifted=False):
     glPopMatrix()
 
 
-def draw_glyph(ch, x, y, z, scale=0.18, flip_text=False):
+def draw_glyph(ch, x, y, z, view_yaw, scale=0.18):
+    """Draw a board label flat on the board and readable from the current view."""
     segs = GLYPHS.get(ch.upper())
     if not segs:
         return
@@ -514,10 +515,9 @@ def draw_glyph(ch, x, y, z, scale=0.18, flip_text=False):
     glLineWidth(1.5)
     glPushMatrix()
     glTranslatef(x, y, z)
+    glRotatef(-math.degrees(view_yaw), 0, 1, 0)
     glRotatef(90, 1, 0, 0)
-    if flip_text:
-        glRotatef(180, 0, 0, 1)
-    glScalef(scale, scale, scale)
+    glScalef(-scale, scale, scale)
     glBegin(GL_LINES)
     for a, b in segs:
         glVertex3f(a[0] - 0.5, a[1] - 0.5, 0)
@@ -605,6 +605,12 @@ class Chess3D:
         self.distance = float(self.cfg.get("camera_distance", 12.4))
         self.pan_x = float(self.cfg.get("camera_pan_x", 0.0))
         self.pan_z = float(self.cfg.get("camera_pan_z", 0.0))
+        if math.cos(self.yaw) < 0:
+            # Always open from White's side, while keeping a panned board in the
+            # same apparent screen position.
+            self.yaw = (self.yaw + math.pi) % math.tau
+            self.pan_x = -self.pan_x
+            self.pan_z = -self.pan_z
         self.target_y = 0.25
         self.selected = self.drag_piece = self.drag_world = self.left_down_pos = None
         self.was_drag = False
@@ -766,13 +772,15 @@ class Chess3D:
                     col = tuple(0.60 * c + 0.40 * l for c, l in zip(col, LEGAL))
                 draw_box(f - 3.5, 0.005, r - 3.5, 0.995, 0.025, 0.995, col)
         if self.show_coordinates:
-            # Camera initially looks from negative Z toward positive Z. With this projection,
-            # screen-left corresponds to +X, so reverse the file labels to render A..H left-to-right.
+            # Screen-left is +X from White's initial view, so files are stored in
+            # reverse world-X order. Keep them on the edge nearest the viewer so
+            # White sees A..H and Black sees H..A after the board is flipped.
+            file_label_z = -4.12 if math.cos(self.yaw) >= 0 else 4.12
             for f, ch in enumerate("HGFEDCBA"):
-                draw_glyph(ch, f - 3.5, 0.035, -4.12, 0.18, flip_text=True)
+                draw_glyph(ch, f - 3.5, 0.035, file_label_z, self.yaw, 0.18)
             # Rank 1 belongs at the near-left corner and increases away from White.
             for r, ch in enumerate("12345678"):
-                draw_glyph(ch, 4.12, 0.035, r - 3.5, 0.18, flip_text=True)
+                draw_glyph(ch, 4.12, 0.035, r - 3.5, self.yaw, 0.18)
 
     def draw(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -1049,7 +1057,9 @@ class Chess3D:
         self.result_text = "View reset"
 
     def flip_board(self):
-        self.yaw += math.pi
+        self.yaw = (self.yaw + math.pi) % math.tau
+        self.pan_x = -self.pan_x
+        self.pan_z = -self.pan_z
         self.mark_camera_dirty()
 
     def stop_clock(self):
